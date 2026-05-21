@@ -1,0 +1,291 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: libreplay
+---
+# LibreReplay — match replay + media platform
+# Stack: libreplay-web (local image), postgres, redis, meilisearch, minio, mailpit
+#
+# Migration strategy (Phase 9):
+#   1. pg_dump libreplay-postgres → restore CloudNativePG
+#   2. meilisearch: dump API + restore
+#   3. minio: mc mirror libreplay-minio → libreplay-minio (k8s)
+#   4. redis: BGSAVE + copy dump.rdb → mount in new pod
+
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: libreplay-secrets
+  namespace: libreplay
+spec:
+  refreshInterval: 1h
+  secretStoreRef: { name: vault-backend, kind: ClusterSecretStore }
+  target:
+    name: libreplay-secrets
+    creationPolicy: Owner
+  dataFrom:
+    - extract: { key: secret/libreplay }
+
+# ── PostgreSQL ────────────────────────────────────────────────────────────────
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: libreplay-postgres-data
+  namespace: libreplay
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 20Gi } }
+  storageClassName: longhorn
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: libreplay-postgres
+  namespace: libreplay
+spec:
+  serviceName: libreplay-postgres
+  replicas: 1
+  selector: { matchLabels: { app: libreplay-postgres } }
+  template:
+    metadata: { labels: { app: libreplay-postgres } }
+    spec:
+      enableServiceLinks: false
+      nodeSelector:
+        topology: lan
+        kubernetes.io/arch: amd64
+        kubernetes.io/hostname: ubuntu
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports: [{ name: postgres, containerPort: 5432 }]
+          env:
+            - { name: POSTGRES_DB, value: libreplay }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: libreplay-secrets, key: DB_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: libreplay-secrets, key: DB_PASSWORD } }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { memory: 1Gi }
+          readinessProbe:
+            exec: { command: [pg_isready, -U, libreplay, -d, libreplay] }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: libreplay-postgres-data }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: libreplay-postgres, namespace: libreplay }
+spec:
+  selector: { app: libreplay-postgres }
+  ports: [{ name: postgres, port: 5432, targetPort: 5432 }]
+
+# ── Redis ──────────────────────────────────────────────────────────────────────
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: libreplay-redis
+  namespace: libreplay
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: libreplay-redis } }
+  template:
+    metadata: { labels: { app: libreplay-redis } }
+    spec:
+      enableServiceLinks: false
+      nodeSelector: { topology: lan, kubernetes.io/arch: amd64 }
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command: [redis-server, --appendonly, "yes"]
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits:   { memory: 256Mi }
+          readinessProbe:
+            exec: { command: [redis-cli, ping] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: libreplay-redis, namespace: libreplay }
+spec:
+  selector: { app: libreplay-redis }
+  ports: [{ name: redis, port: 6379, targetPort: 6379 }]
+
+# ── Meilisearch ────────────────────────────────────────────────────────────────
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: libreplay-meilisearch-data
+  namespace: libreplay
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 10Gi } }
+  storageClassName: longhorn
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: libreplay-meilisearch
+  namespace: libreplay
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: libreplay-meilisearch } }
+  template:
+    metadata: { labels: { app: libreplay-meilisearch } }
+    spec:
+      enableServiceLinks: false
+      nodeSelector: { topology: lan, kubernetes.io/arch: amd64 }
+      containers:
+        - name: meilisearch
+          image: getmeili/meilisearch:v1.10
+          ports: [{ name: http, containerPort: 7700 }]
+          env:
+            - name: MEILI_MASTER_KEY
+              valueFrom: { secretKeyRef: { name: libreplay-secrets, key: MEILI_MASTER_KEY } }
+          volumeMounts:
+            - { name: data, mountPath: /meili_data }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { memory: 2Gi }
+          readinessProbe:
+            httpGet: { path: /health, port: 7700 }
+            initialDelaySeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: libreplay-meilisearch-data }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: libreplay-meilisearch, namespace: libreplay }
+spec:
+  selector: { app: libreplay-meilisearch }
+  ports: [{ name: http, port: 7700, targetPort: 7700 }]
+
+# ── MinIO (media storage) ──────────────────────────────────────────────────────
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: libreplay-minio-data
+  namespace: libreplay
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 100Gi } }
+  storageClassName: longhorn
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: libreplay-minio
+  namespace: libreplay
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: libreplay-minio } }
+  template:
+    metadata: { labels: { app: libreplay-minio } }
+    spec:
+      enableServiceLinks: false
+      nodeSelector: { topology: lan, kubernetes.io/arch: amd64 }
+      containers:
+        - name: minio
+          image: minio/minio:RELEASE.2024-09-13T20-26-02Z
+          args: [server, /data, --console-address, ":9001"]
+          ports:
+            - { name: api, containerPort: 9000 }
+            - { name: console, containerPort: 9001 }
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom: { secretKeyRef: { name: libreplay-secrets, key: MINIO_ROOT_USER } }
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: libreplay-secrets, key: MINIO_ROOT_PASSWORD } }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { memory: 1Gi }
+          readinessProbe:
+            httpGet: { path: /minio/health/live, port: 9000 }
+            initialDelaySeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: libreplay-minio-data }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: libreplay-minio, namespace: libreplay }
+spec:
+  selector: { app: libreplay-minio }
+  ports:
+    - { name: api, port: 9000, targetPort: 9000 }
+    - { name: console, port: 9001, targetPort: 9001 }
+
+# ── LibreReplay web (stateless) ───────────────────────────────────────────────
+# Scale to 0 until Phase 9 data migration completes
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: libreplay-web
+  namespace: libreplay
+spec:
+  replicas: 0   # scale to 1 after Phase 9 stores seeded
+  selector: { matchLabels: { app: libreplay-web } }
+  template:
+    metadata: { labels: { app: libreplay-web } }
+    spec:
+      enableServiceLinks: false
+      nodeSelector: { topology: lan, kubernetes.io/arch: amd64 }
+      containers:
+        - name: libreplay-web
+          image: harbor.e-dani.com/homelab/libreplay-web:latest
+          ports: [{ name: http, containerPort: 3000 }]
+          env:
+            - { name: DATABASE_URL, value: "postgresql://$(DB_USER):$(DB_PASSWORD)@libreplay-postgres.libreplay.svc.cluster.local:5432/libreplay" }
+            - { name: REDIS_URL, value: "redis://libreplay-redis.libreplay.svc.cluster.local:6379" }
+            - { name: MEILISEARCH_URL, value: "http://libreplay-meilisearch.libreplay.svc.cluster.local:7700" }
+            - { name: MINIO_ENDPOINT, value: "libreplay-minio.libreplay.svc.cluster.local:9000" }
+          envFrom: [{ secretRef: { name: libreplay-secrets } }]
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { memory: 1Gi }
+          readinessProbe:
+            httpGet: { path: /api/health, port: 3000 }
+            initialDelaySeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata: { name: libreplay-web, namespace: libreplay }
+spec:
+  selector: { app: libreplay-web }
+  ports: [{ name: http, port: 80, targetPort: 3000 }]
+---
+# LAN access
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: libreplay-lan
+  namespace: libreplay
+spec:
+  entryPoints: [websecure]
+  routes:
+    - match: Host(`libreplay.lan.e-dani.com`)
+      kind: Rule
+      services:
+        - name: libreplay-web
+          port: 80
+      middlewares:
+        - { name: authelia, namespace: authelia }
+  tls:
+    secretName: wildcard-lan-tls
