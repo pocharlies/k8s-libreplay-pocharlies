@@ -47,7 +47,7 @@ metadata:
   namespace: libreplay
 spec:
   serviceName: libreplay-postgres
-  replicas: 1
+  replicas: 0
   selector: { matchLabels: { app: libreplay-postgres } }
   template:
     metadata: { labels: { app: libreplay-postgres } }
@@ -96,7 +96,7 @@ metadata:
   name: libreplay-redis
   namespace: libreplay
 spec:
-  replicas: 1
+  replicas: 0
   strategy: { type: Recreate }
   selector: { matchLabels: { app: libreplay-redis } }
   template:
@@ -139,7 +139,7 @@ metadata:
   name: libreplay-meilisearch
   namespace: libreplay
 spec:
-  replicas: 1
+  replicas: 0
   strategy: { type: Recreate }
   selector: { matchLabels: { app: libreplay-meilisearch } }
   template:
@@ -191,7 +191,7 @@ metadata:
   name: libreplay-minio
   namespace: libreplay
 spec:
-  replicas: 1
+  replicas: 0
   strategy: { type: Recreate }
   selector: { matchLabels: { app: libreplay-minio } }
   template:

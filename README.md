@@ -8,3 +8,7 @@ LibreReplay — plataforma de replays de partidas. Monorepo: web + postgres prop
 
 ## GitOps
 Gestionado por ArgoCD desde [k8s-gitops-pocharlies](https://github.com/pocharlies/k8s-gitops-pocharlies).
+
+## Estado operativo
+- 2026-05-22: LibreReplay queda parado a `replicas: 0` completo hasta migrar/sembrar datos.
+- PVCs y Services se conservan para la futura migración de Postgres, Redis, MinIO y Meilisearch.
