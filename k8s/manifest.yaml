@@ -288,4 +288,5 @@ spec:
           port: 80
       middlewares:
         - { name: authelia, namespace: authelia }
-  tls: {}
+  tls:
+    store: { name: default, namespace: traefik-lan }
