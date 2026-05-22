@@ -288,5 +288,4 @@ spec:
           port: 80
       middlewares:
         - { name: authelia, namespace: authelia }
-  tls:
-    secretName: wildcard-lan-tls
+  tls: {}
